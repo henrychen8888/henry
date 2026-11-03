@@ -16,7 +16,7 @@ const path = require('path');
 const os = require('os');
 const { execFileSync } = require('child_process');
 
-const VERSION = '2026.11.4';
+const VERSION = '2026.11.4.1';
 const CONFIG_DIR = path.join(os.homedir(), '.config', 'ghpub');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const API_BASE = 'https://api.github.com';
