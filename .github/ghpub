@@ -150,6 +150,50 @@ function makeApi(token, host = API_BASE) {
       if (res.status !== 201) throw new Error(`上传 Release 附件 ${name} 失败 (${res.status}): ${JSON.stringify(data && data.message)}`);
       return data;
     },
+    // —— Git Data API：用于绕过 Contents API 对 .github/workflows 等路径的 404 限制 ——
+    async getTree(owner, repo, sha) {
+      const { status, data } = await req('GET', `/repos/${owner}/${repo}/git/trees/${sha}?recursive=1`);
+      if (status !== 200) throw new Error(`获取树失败 (${status})`);
+      return data;
+    },
+    async createBlob(owner, repo, content) {
+      const { status, data } = await req('POST', `/repos/${owner}/${repo}/git/blobs`, { content, encoding: 'base64' });
+      if (status !== 201) throw new Error(`创建 blob 失败 (${status})`);
+      return data.sha;
+    },
+    async createTree(owner, repo, baseTree, entries) {
+      const { status, data } = await req('POST', `/repos/${owner}/${repo}/git/trees`, { base_tree: baseTree, tree: entries });
+      if (status !== 201) throw new Error(`创建树失败 (${status})`);
+      return data.sha;
+    },
+    async getCommit(owner, repo, sha) {
+      const { status, data } = await req('GET', `/repos/${owner}/${repo}/git/commits/${sha}`);
+      if (status !== 200) throw new Error(`获取 commit 失败 (${status})`);
+      return data;
+    },
+    async createCommit(owner, repo, message, tree, parents) {
+      const { status, data } = await req('POST', `/repos/${owner}/${repo}/git/commits`, { message, tree, parents });
+      if (status !== 201) throw new Error(`创建 commit 失败 (${status})`);
+      return data.sha;
+    },
+    async updateRef(owner, repo, ref, sha) {
+      const { status, data } = await req('PATCH', `/repos/${owner}/${repo}/git/refs/${ref}`, { sha, force: true });
+      if (status !== 200) throw new Error(`更新 ref 失败 (${status})`);
+      return data;
+    },
+    // 经 Git Data API 提交单个文件（绕过 Contents API 对 .github/workflows 的 404 限制）
+    async commitFile(owner, repo, branch, filePath, contentBase64, message) {
+      const refRes = await this.getRef(owner, repo, `heads/${branch}`);
+      const commitSha = refRes.object.sha;
+      const baseTree = (await this.getCommit(owner, repo, commitSha)).tree.sha;
+      const blobSha = await this.createBlob(owner, repo, contentBase64);
+      const newTree = await this.createTree(owner, repo, baseTree, [
+        { path: filePath, mode: '100644', type: 'blob', sha: blobSha },
+      ]);
+      const newCommitSha = await this.createCommit(owner, repo, message, newTree, [commitSha]);
+      await this.updateRef(owner, repo, `heads/${branch}`, newCommitSha);
+      return newCommitSha;
+    },
     // —— 以下内容走纯 REST API（绕开 git 协议，适合受限网络）——
     async getContent(owner, repo, p, ref) {
       const q = ref ? `?ref=${encodeURIComponent(ref)}` : '';
@@ -369,9 +413,15 @@ async function apiPublish(folder, o, api) {
       const ex = await api.getContent(o.owner, o.repo, rel, branch);
       if (ex && ex.sha) sha = ex.sha; // 已存在 → 更新需带 sha
     } catch { /* 404 表示不存在，直接创建 */ }
-    const { status, data } = await api.putContent(o.owner, o.repo, rel, b64, message, sha, branch);
-    if (status !== 200 && status !== 201) {
-      throw new Error(`上传 ${rel} 失败 (${status}): ${JSON.stringify(data && data.message)}`);
+    const res = await api.putContent(o.owner, o.repo, rel, b64, message, sha, branch);
+    if (res.status !== 200 && res.status !== 201) {
+      // Contents API 对 .github/workflows 等路径返回 404，改用 Git Data API 提交
+      if (res.status === 404) {
+        await api.commitFile(o.owner, o.repo, branch, rel, b64, message);
+        ok(`已上传 ${rel}（经 Git Data API）`);
+        continue;
+      }
+      throw new Error(`上传 ${rel} 失败 (${res.status}): ${JSON.stringify(res.data && res.data.message)}`);
     }
     ok(`已上传 ${rel}`);
   }
@@ -469,10 +519,13 @@ async function cmdPublish(opts) {
   if (!token) exit('尚未登录，请先执行: ghpub login --token <PAT> 或设置环境变量 GH_TOKEN');
   const api = makeApi(token, opts.host || cfg.host || API_BASE);
 
-  let user;
-  try { user = await api.getUser(); }
-  catch (e) { exit(e.message); }
-  const owner = ownerResolved || user.login;
+  // CI（GitHub Actions）使用的 GITHUB_TOKEN 无权访问 GET /user，
+  // 因此仅当 owner 无法从 origin 远程 / --owner 解析时才查 /user，且失败不再致命。
+  let owner = ownerResolved;
+  if (!owner) {
+    try { owner = (await api.getUser()).login; }
+    catch (e) { exit(`无法解析目标 owner（CI 中请确保 origin 远程已设置，或传入 --owner）: ${e.message}`); }
+  }
 
   const exists = await api.repoExists(owner, meta.repo);
   if (!exists) {
